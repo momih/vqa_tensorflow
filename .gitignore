@@ -1,0 +1,5 @@
+.idea/
+.spyproject/
+logs/
+resnet152_weights_tf.h5
+*.pyc
