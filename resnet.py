@@ -1,211 +1,339 @@
-# from https://gist.github.com/mvoelk/ef4fc7fb905be7191cc2beb1421da37c
+""" 
+Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
-import numpy as np
-import copy
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
-from keras.layers import Input, Dense, Conv2D, MaxPooling2D, AveragePooling2D, ZeroPadding2D, Flatten, Activation, add
-from keras.optimizers import SGD
-from keras.layers.normalization import BatchNormalization
-from keras.models import Model
-from keras import initializers
-from keras.engine import Layer, InputSpec
-from keras import backend as K
+ http://www.apache.org/licenses/LICENSE-2.0
 
-import sys
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================
+ Contains definitions for the preactivation form of Residual Networks.
 
-sys.setrecursionlimit(3000)
+Residual networks (ResNets) were originally proposed in:
+[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+    Deep Residual Learning for Image Recognition. arXiv:1512.03385
 
-# TODO add download link for resnet weights
+The full preactivation 'v2' ResNet variant implemented in this module was
+introduced by:
+[2] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+    Identity Mappings in Deep Residual Networks. arXiv: 1603.05027
 
-class Scale(Layer):
-    '''Custom Layer for ResNet used for BatchNormalization.
+The key difference of the full preactivation 'v2' variant compared to the
+'v1' variant in [1] is the use of batch normalization before every weight layer.
 
-    Learns a set of weights and biases used for scaling the input data.
-    the output consists simply in an element-wise multiplication of the input
-    and a sum of a set of constants:
-        out = in * gamma + beta,
-    where 'gamma' and 'beta' are the weights and biases larned.
-    # Arguments
-        axis: integer, axis along which to normalize in mode 0. For instance,
-            if your input tensor has shape (samples, channels, rows, cols),
-            set axis to 1 to normalize per feature map (channels axis).
-        momentum: momentum in the computation of the
-            exponential average of the mean and standard deviation
-            of the data, for feature-wise normalization.
-        weights: Initialization weights.
-            List of 2 Numpy arrays, with shapes:
-            `[(input_shape,), (input_shape,)]`
-        beta_init: name of initialization function for shift parameter
-            (see [initializers](../initializers.md)), or alternatively,
-            Theano/TensorFlow function to use for weights initialization.
-            This parameter is only relevant if you don't pass a `weights` argument.
-        gamma_init: name of initialization function for scale parameter (see
-            [initializers](../initializers.md)), or alternatively,
-            Theano/TensorFlow function to use for weights initialization.
-            This parameter is only relevant if you don't pass a `weights` argument.
-    '''
+Typical use:
 
-    def __init__(self, weights=None, axis=-1, momentum=0.9, beta_init='zero', gamma_init='one', **kwargs):
-        self.momentum = momentum
-        self.axis = axis
-        self.beta_init = initializers.get(beta_init)
-        self.gamma_init = initializers.get(gamma_init)
-        self.initial_weights = weights
-        super(Scale, self).__init__(**kwargs)
+   from tensorflow.contrib.slim.nets import resnet_v2
 
-    def build(self, input_shape):
-        self.input_spec = [InputSpec(shape=input_shape)]
-        shape = (int(input_shape[self.axis]),)
+ResNet-101 for image classification into 1000 classes:
 
-        self.gamma = K.variable(self.gamma_init(shape), name='%s_gamma' % self.name)
-        self.beta = K.variable(self.beta_init(shape), name='%s_beta' % self.name)
-        self.trainable_weights = [self.gamma, self.beta]
+   # inputs has shape [batch, 224, 224, 3]
+   with slim.arg_scope(resnet_v2.resnet_arg_scope()):
+      net, end_points = resnet_v2.resnet_v2_101(inputs, 1000, is_training=False)
 
-        if self.initial_weights is not None:
-            self.set_weights(self.initial_weights)
-            del self.initial_weights
+ResNet-101 for semantic segmentation into 21 classes:
 
-    def call(self, x, mask=None):
-        input_shape = self.input_spec[0].shape
-        broadcast_shape = [1] * len(input_shape)
-        broadcast_shape[self.axis] = input_shape[self.axis]
+   # inputs has shape [batch, 513, 513, 3]
+   with slim.arg_scope(resnet_v2.resnet_arg_scope()):
+      net, end_points = resnet_v2.resnet_v2_101(inputs,
+                                                21,
+                                                is_training=False,
+                                                global_pool=False,
+                                                output_stride=16)
+"""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
-        out = K.reshape(self.gamma, broadcast_shape) * x + K.reshape(self.beta, broadcast_shape)
-        return out
+import tensorflow as tf
 
-    def get_config(self):
-        config = {"momentum": self.momentum, "axis": self.axis}
-        base_config = super(Scale, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+import resnet_utils
+
+slim = tf.contrib.slim
+resnet_arg_scope = resnet_utils.resnet_arg_scope
 
 
-class ResNetFeatures(object):
-    def __init__(self):
-        '''Instantiate the ResNet152 architecture,
-        # Arguments
-            weights_path: path to pretrained weight file
-        # Returns
-            A Keras model instance.
-        '''
-        eps = 1.1e-5
+@slim.add_arg_scope
+def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
+               outputs_collections=None, scope=None):
+  """Bottleneck residual unit variant with BN before convolutions.
+
+  This is the full preactivation residual unit variant proposed in [2]. See
+  Fig. 1(b) of [2] for its definition. Note that we use here the bottleneck
+  variant which has an extra bottleneck layer.
+
+  When putting together two consecutive ResNet blocks that use this unit, one
+  should use stride = 2 in the last unit of the first block.
+
+  Args:
+    inputs: A tensor of size [batch, height, width, channels].
+    depth: The depth of the ResNet unit output.
+    depth_bottleneck: The depth of the bottleneck layers.
+    stride: The ResNet unit's stride. Determines the amount of downsampling of
+      the units output compared to its input.
+    rate: An integer, rate for atrous convolution.
+    outputs_collections: Collection to add the ResNet unit output.
+    scope: Optional variable_scope.
+
+  Returns:
+    The ResNet unit's output.
+  """
+  with tf.variable_scope(scope, 'bottleneck_v2', [inputs]) as sc:
+    depth_in = slim.utils.last_dimension(inputs.get_shape(), min_rank=4)
+    preact = slim.batch_norm(inputs, activation_fn=tf.nn.relu, scope='preact')
+    if depth == depth_in:
+      shortcut = resnet_utils.subsample(inputs, stride, 'shortcut')
+    else:
+      shortcut = slim.conv2d(preact, depth, [1, 1], stride=stride,
+                             normalizer_fn=None, activation_fn=None,
+                             scope='shortcut')
+
+    residual = slim.conv2d(preact, depth_bottleneck, [1, 1], stride=1,
+                           scope='conv1')
+    residual = resnet_utils.conv2d_same(residual, depth_bottleneck, 3, stride,
+                                        rate=rate, scope='conv2')
+    residual = slim.conv2d(residual, depth, [1, 1], stride=1,
+                           normalizer_fn=None, activation_fn=None,
+                           scope='conv3')
+
+    output = shortcut + residual
+
+    return slim.utils.collect_named_outputs(outputs_collections,
+                                            sc.name,
+                                            output)
+
+
+def resnet_v2(inputs,
+              blocks,
+              num_classes=None,
+              is_training=True,
+              global_pool=True,
+              output_stride=None,
+              include_root_block=True,
+              spatial_squeeze=True,
+              reuse=None,
+              scope=None):
+  """Generator for v2 (preactivation) ResNet models.
+
+  This function generates a family of ResNet v2 models. See the resnet_v2_*()
+  methods for specific model instantiations, obtained by selecting different
+  block instantiations that produce ResNets of various depths.
+
+  Training for image classification on Imagenet is usually done with [224, 224]
+  inputs, resulting in [7, 7] feature maps at the output of the last ResNet
+  block for the ResNets defined in [1] that have nominal stride equal to 32.
+  However, for dense prediction tasks we advise that one uses inputs with
+  spatial dimensions that are multiples of 32 plus 1, e.g., [321, 321]. In
+  this case the feature maps at the ResNet output will have spatial shape
+  [(height - 1) / output_stride + 1, (width - 1) / output_stride + 1]
+  and corners exactly aligned with the input image corners, which greatly
+  facilitates alignment of the features to the image. Using as input [225, 225]
+  images results in [8, 8] feature maps at the output of the last ResNet block.
+
+  For dense prediction tasks, the ResNet needs to run in fully-convolutional
+  (FCN) mode and global_pool needs to be set to False. The ResNets in [1, 2] all
+  have nominal stride equal to 32 and a good choice in FCN mode is to use
+  output_stride=16 in order to increase the density of the computed features at
+  small computational and memory overhead, cf. http://arxiv.org/abs/1606.00915.
+
+  Args:
+    inputs: A tensor of size [batch, height_in, width_in, channels].
+    blocks: A list of length equal to the number of ResNet blocks. Each element
+      is a resnet_utils.Block object describing the units in the block.
+    num_classes: Number of predicted classes for classification tasks.
+      If 0 or None, we return the features before the logit layer.
+    is_training: whether batch_norm layers are in training mode.
+    global_pool: If True, we perform global average pooling before computing the
+      logits. Set to True for image classification, False for dense prediction.
+    output_stride: If None, then the output will be computed at the nominal
+      network stride. If output_stride is not None, it specifies the requested
+      ratio of input to output spatial resolution.
+    include_root_block: If True, include the initial convolution followed by
+      max-pooling, if False excludes it. If excluded, `inputs` should be the
+      results of an activation-less convolution.
+    spatial_squeeze: if True, logits is of shape [B, C], if false logits is
+        of shape [B, 1, 1, C], where B is batch_size and C is number of classes.
+        To use this parameter, the input images must be smaller than 300x300
+        pixels, in which case the output logit layer does not contain spatial
+        information and can be removed.
+    reuse: whether or not the network and its variables should be reused. To be
+      able to reuse 'scope' must be given.
+    scope: Optional variable_scope.
+
+
+  Returns:
+    net: A rank-4 tensor of size [batch, height_out, width_out, channels_out].
+      If global_pool is False, then height_out and width_out are reduced by a
+      factor of output_stride compared to the respective height_in and width_in,
+      else both height_out and width_out equal one. If num_classes is 0 or None,
+      then net is the output of the last ResNet block, potentially after global
+      average pooling. If num_classes is a non-zero integer, net contains the
+      pre-softmax activations.
+    end_points: A dictionary from components of the network to the corresponding
+      activation.
+
+  Raises:
+    ValueError: If the target output_stride is not valid.
+  """
+  with tf.variable_scope(scope, 'resnet_v2', [inputs], reuse=reuse) as sc:
+    end_points_collection = sc.original_name_scope + '_end_points'
+    with slim.arg_scope([slim.conv2d, bottleneck,
+                         resnet_utils.stack_blocks_dense],
+                        outputs_collections=end_points_collection):
+      with slim.arg_scope([slim.batch_norm], is_training=is_training):
+        net = inputs
+        if include_root_block:
+          if output_stride is not None:
+            if output_stride % 4 != 0:
+              raise ValueError('The output_stride needs to be a multiple of 4.')
+            output_stride /= 4
+          # We do not include batch normalization or activation functions in
+          # conv1 because the first ResNet unit will perform these. Cf.
+          # Appendix of [2].
+          with slim.arg_scope([slim.conv2d],
+                              activation_fn=None, normalizer_fn=None):
+            net = resnet_utils.conv2d_same(net, 64, 7, stride=2, scope='conv1')
+          net = slim.max_pool2d(net, [3, 3], stride=2, scope='pool1')
+        net = resnet_utils.stack_blocks_dense(net, blocks, output_stride)
+        # This is needed because the pre-activation variant does not have batch
+        # normalization or activation functions in the residual unit output. See
+        # Appendix of [2].
+        net = slim.batch_norm(net, activation_fn=tf.nn.relu, scope='postnorm')
+        # Convert end_points_collection into a dictionary of end_points.
+        end_points = slim.utils.convert_collection_to_dict(
+            end_points_collection)
+
+        if global_pool:
+          # Global average pooling.
+          net = tf.reduce_mean(net, [1, 2], name='pool5', keep_dims=True)
+          end_points['global_pool'] = net
+        if num_classes:
+          net = slim.conv2d(net, num_classes, [1, 1], activation_fn=None,
+                            normalizer_fn=None, scope='logits')
+          end_points[sc.name + '/logits'] = net
+          if spatial_squeeze:
+            net = tf.squeeze(net, [1, 2], name='SpatialSqueeze')
+            end_points[sc.name + '/spatial_squeeze'] = net
+          end_points['predictions'] = slim.softmax(net, scope='predictions')
     
-        # Handle Dimension Ordering for different backends
-        global bn_axis
-        bn_axis = 3
-        img_input = Input(shape=(448,448,3), name='data')
-        
-        x = ZeroPadding2D((3, 3), name='conv1_zeropadding')(img_input)
-        x = Conv2D(64, (7, 7), strides=(2, 2), name='conv1', use_bias=False)(x)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name='bn_conv1')(x)
-        x = Scale(axis=bn_axis, name='scale_conv1')(x)
-        x = Activation('relu', name='conv1_relu')(x)
-        x = MaxPooling2D((3, 3), strides=(2, 2), name='pool1')(x)
-    
-        x = self.conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1))
-        x = self.identity_block(x, 3, [64, 64, 256], stage=2, block='b')
-        x = self.identity_block(x, 3, [64, 64, 256], stage=2, block='c')
-    
-        x = self.conv_block(x, 3, [128, 128, 512], stage=3, block='a')
-        for i in range(1, 8):
-            x = self.identity_block(x, 3, [128, 128, 512], stage=3, block='b' + str(i))
-    
-        x = self.conv_block(x, 3, [256, 256, 1024], stage=4, block='a')
-        for i in range(1, 36):
-            x = self.identity_block(x, 3, [256, 256, 1024], stage=4, block='b' + str(i))
-    
-        x = self.conv_block(x, 3, [512, 512, 2048], stage=5, block='a')
-        x = self.identity_block(x, 3, [512, 512, 2048], stage=5, block='b')
-        x = self.identity_block(x, 3, [512, 512, 2048], stage=5, block='c')
-    
-        x_fc = AveragePooling2D((7, 7), name='avg_pool')(x)
-        x_fc = Flatten()(x_fc)
-        x_fc = Dense(1000, activation='softmax', name='fc1000')(x_fc)
-    
-        self.model = Model(img_input, x_fc)
-            
-    def __call__(self, img, weights_path):
-        # load weights
-        if weights_path:
-            self.model.load_weights(weights_path, by_name=True)
-        layer_name = 'res5c_relu'
-        model = Model(inputs=self.model.input, outputs=self.model.get_layer(layer_name).output)
-        for layer in model.layers:
-            layer.trainable = False
-        return model.predict(img)
-    
-    def identity_block(self, input_tensor, kernel_size, filters, stage, block):
-        '''The self.identity_block is the block that has no conv layer at shortcut
-        # Arguments
-            input_tensor: input tensor
-            kernel_size: defualt 3, the kernel size of middle conv layer at main path
-            filters: list of integers, the nb_filters of 3 conv layer at main path
-            stage: integer, current stage label, used for generating layer names
-            block: 'a','b'..., current block label, used for generating layer names
-        '''
-        eps = 1.1e-5
-        nb_filter1, nb_filter2, nb_filter3 = filters
-        conv_name_base = 'res' + str(stage) + block + '_branch'
-        bn_name_base = 'bn' + str(stage) + block + '_branch'
-        scale_name_base = 'scale' + str(stage) + block + '_branch'
-    
-        x = Conv2D(nb_filter1, (1, 1), name=conv_name_base + '2a', use_bias=False)(input_tensor)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2a')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2a')(x)
-        x = Activation('relu', name=conv_name_base + '2a_relu')(x)
-    
-        x = ZeroPadding2D((1, 1), name=conv_name_base + '2b_zeropadding')(x)
-        x = Conv2D(nb_filter2, (kernel_size, kernel_size), name=conv_name_base + '2b', use_bias=False)(x)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2b')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2b')(x)
-        x = Activation('relu', name=conv_name_base + '2b_relu')(x)
-    
-        x = Conv2D(nb_filter3, (1, 1), name=conv_name_base + '2c', use_bias=False)(x)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2c')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2c')(x)
-    
-        x = add([x, input_tensor], name='res' + str(stage) + block)
-        x = Activation('relu', name='res' + str(stage) + block + '_relu')(x)
-        return x
-    
-    
-    def conv_block(self, input_tensor, kernel_size, filters, stage, block, strides=(2, 2)):
-        '''self.conv_block is the block that has a conv layer at shortcut
-        # Arguments
-            input_tensor: input tensor
-            kernel_size: defualt 3, the kernel size of middle conv layer at main path
-            filters: list of integers, the nb_filters of 3 conv layer at main path
-            stage: integer, current stage label, used for generating layer names
-            block: 'a','b'..., current block label, used for generating layer names
-        Note that from stage 3, the first conv layer at main path is with subsample=(2,2)
-        And the shortcut should have subsample=(2,2) as well
-        '''
-        eps = 1.1e-5
-        nb_filter1, nb_filter2, nb_filter3 = filters
-        conv_name_base = 'res' + str(stage) + block + '_branch'
-        bn_name_base = 'bn' + str(stage) + block + '_branch'
-        scale_name_base = 'scale' + str(stage) + block + '_branch'
-    
-        x = Conv2D(nb_filter1, (1, 1), strides=strides, name=conv_name_base + '2a', use_bias=False)(input_tensor)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2a')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2a')(x)
-        x = Activation('relu', name=conv_name_base + '2a_relu')(x)
-    
-        x = ZeroPadding2D((1, 1), name=conv_name_base + '2b_zeropadding')(x)
-        x = Conv2D(nb_filter2, (kernel_size, kernel_size),
-                   name=conv_name_base + '2b', use_bias=False)(x)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2b')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2b')(x)
-        x = Activation('relu', name=conv_name_base + '2b_relu')(x)
-    
-        x = Conv2D(nb_filter3, (1, 1), name=conv_name_base + '2c', use_bias=False)(x)
-        x = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '2c')(x)
-        x = Scale(axis=bn_axis, name=scale_name_base + '2c')(x)
-    
-        shortcut = Conv2D(nb_filter3, (1, 1), strides=strides,
-                          name=conv_name_base + '1', use_bias=False)(input_tensor)
-        shortcut = BatchNormalization(epsilon=eps, axis=bn_axis, name=bn_name_base + '1')(shortcut)
-        shortcut = Scale(axis=bn_axis, name=scale_name_base + '1')(shortcut)
-    
-        x = add([x, shortcut], name='res' + str(stage) + block)
-        x = Activation('relu', name='res' + str(stage) + block + '_relu')(x)
-        return x
+        return net, end_points
+resnet_v2.default_image_size = 224
+
+
+def resnet_v2_block(scope, base_depth, num_units, stride):
+  """Helper function for creating a resnet_v2 bottleneck block.
+
+  Args:
+    scope: The scope of the block.
+    base_depth: The depth of the bottleneck layer for each unit.
+    num_units: The number of units in the block.
+    stride: The stride of the block, implemented as a stride in the last unit.
+      All other units have stride=1.
+
+  Returns:
+    A resnet_v2 bottleneck block.
+  """
+  return resnet_utils.Block(scope, bottleneck, [{
+      'depth': base_depth * 4,
+      'depth_bottleneck': base_depth,
+      'stride': 1
+  }] * (num_units - 1) + [{
+      'depth': base_depth * 4,
+      'depth_bottleneck': base_depth,
+      'stride': stride
+  }])
+resnet_v2.default_image_size = 224
+
+
+def resnet_v2_50(inputs,
+                 num_classes=None,
+                 is_training=False,
+                 global_pool=False,
+                 output_stride=None,
+                 spatial_squeeze=True,
+                 reuse=None,
+                 scope='resnet_v2_50'):
+  """ResNet-50 model of [1]. See resnet_v2() for arg and return description."""
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=4, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=6, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+resnet_v2_50.default_image_size = resnet_v2.default_image_size
+
+
+def resnet_v2_101(inputs,
+                  num_classes=None,
+                  is_training=True,
+                  global_pool=True,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_101'):
+  """ResNet-101 model of [1]. See resnet_v2() for arg and return description."""
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=4, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=23, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+resnet_v2_101.default_image_size = resnet_v2.default_image_size
+
+
+def resnet_v2_152(inputs,
+                  num_classes=None,
+                  is_training=False,
+                  global_pool=False,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_152'):
+  """ResNet-152 model of [1]. See resnet_v2() for arg and return description."""
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=8, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=36, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+resnet_v2_152.default_image_size = resnet_v2.default_image_size
+
+
+def resnet_v2_200(inputs,
+                  num_classes=None,
+                  is_training=True,
+                  global_pool=True,
+                  output_stride=None,
+                  spatial_squeeze=True,
+                  reuse=None,
+                  scope='resnet_v2_200'):
+  """ResNet-200 model of [2]. See resnet_v2() for arg and return description."""
+  blocks = [
+      resnet_v2_block('block1', base_depth=64, num_units=3, stride=2),
+      resnet_v2_block('block2', base_depth=128, num_units=24, stride=2),
+      resnet_v2_block('block3', base_depth=256, num_units=36, stride=2),
+      resnet_v2_block('block4', base_depth=512, num_units=3, stride=1),
+  ]
+  return resnet_v2(inputs, blocks, num_classes, is_training=is_training,
+                   global_pool=global_pool, output_stride=output_stride,
+                   include_root_block=True, spatial_squeeze=spatial_squeeze,
+                   reuse=reuse, scope=scope)
+resnet_v2_200.default_image_size = resnet_v2.default_image_size

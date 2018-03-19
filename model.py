@@ -1,7 +1,14 @@
 from ops import conv2d_layer, fc_layer
+from resnet import resnet_v2_152
+from resnet_utils import resnet_arg_scope
+from VQA import VQADataSet
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]=""
 import tensorflow as tf
-import numpy as np
-from resnet import ResNetFeatures
+import time
+
+
+slim = tf.contrib.slim
 
 class Model(object):
     """
@@ -9,8 +16,8 @@ class Model(object):
         [0]: https://arxiv.org/abs/1704.03162
     """
 
-    def __init__(self, state_size, lr, batch_size, epochs, features_path, 
-                 vocabulary_size, embedding_size=300, most_freq_limit=3000,
+    def __init__(self, batch_size, init_lr=0.001, reuse=False, vocabulary_size=10546, state_size=1024,
+                 embedding_size=300, dropout_prob=0.5, most_freq_limit=3000,
                  summary_dir='./logs/'):
 
         """
@@ -20,85 +27,125 @@ class Model(object):
         """
         self.state_size = state_size
         self.batch_size = batch_size
-        self.lr = lr
-        self.epochs = epochs
+        self.init_lr = init_lr
+        self.reuse= reuse
         self.embedding_size = embedding_size
         self.vocabulary_size = vocabulary_size
+        self.dropout_prob = dropout_prob
         self.most_freq_limit = most_freq_limit
         self.summary_dir = summary_dir
-        self.features_path = features_path
-        self.session = tf.Session()
+        self.sess = tf.Session()
         self.build_model()
 
-
     def build_model(self):
+        print('\nBuilding Model')
         # Creating placeholders for the question and the answer
-        self.questions = tf.placeholder(tf.float32, shape=[None, self.max_ques_length, 1])
-        self.answers = tf.placeholder(tf.float16, shape=[None, self.most_freq_limit])
-        self.images = tf.placeholder(tf.float32, shape=[None, 299, 299, 3])
+        self.questions = tf.placeholder(tf.int64, shape=[None, 15], name="question_vector") 
+        self.answers = tf.placeholder(tf.float32, shape=[None, self.most_freq_limit], name="answer_vector")
+        self.images = tf.placeholder(tf.float32, shape=[None, 448, 448, 3], name="images_matrix")
 
-        image_features = self.extract_resnet_features(self.images)
-        text_features = self.extract_text_features(self.questions)
-        attention_features = self.compute_attention(image_features, text_features)
+        arg_scope = resnet_arg_scope()
+        with slim.arg_scope(arg_scope):
+            self.image_features, _ = resnet_v2_152(self.images, reuse=tf.AUTO_REUSE)
+        
+        with tf.variable_scope("text_features") as scope:
+            if self.reuse:
+                scope.reuse_variables()
+            word_embeddings = tf.Variable(tf.random_uniform([10546, self.embedding_size], 0.1, 1.0), name="embeddings")
+            word_vectors = tf.nn.embedding_lookup(word_embeddings, self.questions)
+            lstm_input = tf.nn.dropout(tf.nn.tanh(word_vectors, name="lstm_input"),
+                                       keep_prob=self.dropout_prob)
+            _, final_state = tf.nn.dynamic_rnn(tf.nn.rnn_cell.LSTMCell(self.state_size),
+                                               lstm_input, dtype=tf.float32)
+            self.text_features = final_state.c
+        
+        self.attention_features = self.compute_attention(self.image_features, self.text_features)
 
-        fc1 = tf.nn.relu(fc_layer(attention_features, 1024, name="fc1"))
-        answer_logits = fc_layer(fc1, 3000, name="fc2")
-        self.answer_prob = tf.nn.softmax(answer_logits)
-        self.loss = -tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.answers, 
-                                                                           logits=answer_logits))
+        self.fc1 = tf.nn.dropout(tf.nn.relu(fc_layer(self.attention_features, 1024, name="fc1")),
+                                 keep_prob=self.dropout_prob)
+        self.answer_logits = tf.nn.dropout(fc_layer(self.fc1, 3000, name="fc2"),
+                                           keep_prob=self.dropout_prob)
+        self.answer_prob = tf.nn.softmax(self.answer_logits)
+        self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=self.answers, 
+                                                                           logits=self.answer_logits))
+        
+        self.global_step = 0
+        self.lr = tf.train.exponential_decay(learning_rate=self.init_lr, 
+                                             global_step=self.global_step,
+                                             decay_steps=10000,
+                                             decay_rate=0.5,
+                                             staircase=True)
+        
+        self.optimizer = tf.train.AdamOptimizer(self.lr, beta1=0.9, beta2=0.999, name="optim")
 
-    def _initialize_vars_and_summaries(self):
+
+    def train(self, epochs):
+        # Loading resnet pretrained weights
+        train_vars = [x for x in tf.global_variables() if "resnet" not in x.name]
+        
+        self.saver = tf.train.Saver()
+        self.tf_summary_writer = tf.summary.FileWriter(self.summary_dir, self.sess.graph)
+       
         init_op = tf.global_variables_initializer()
-        self.session.run(init_op)
-        self.tf_summary_writer = tf.summary.FileWriter(self.summary_dir, self.session.graph)
-
-    def train(self):
-        self._initialize_vars_and_summaries()
-        optim = tf.train.AdamOptimizer(self.lr, beta1=0.9, beta2=0.999)\
-                        .minimize(self.loss)
         
-        pass
-
-    def extract_resnet_features(self, img):
-        resnet = ResNetFeatures()
-        return resnet(img)
-    
-    def extract_text_features(self, text):
-        word_embeddings = tf.get_variable('word_embeddings', [self.vocabulary_size, self.embedding_size])
-        lstm_input = tf.nn.embedding_lookup(word_embeddings, text)
-        _, final_state = tf.nn.dynamic_rnn(tf.nn.rnn_cell.LSTMCell(1024),
-                                           lstm_input, dtype=tf.float32)
-        return final_state.c
-
-
-    def compute_attention(self, image, text):        
-        text_replicated = self._replicate_state(text, (1, 14, 14, 1))
+        resnet_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope="resnet")
+        load_resnet = tf.train.Saver(var_list=resnet_vars)
+        load_resnet.restore(self.sess, 'resnet_ckpt/resnet_v2_152.ckpt')
+         
+        train_vars = [x for x in tf.global_variables() if "resnet" not in x.name]
+        train_step = self.optimizer.minimize(self.loss, var_list=train_vars, 
+                                             global_step=self.global_step)
+        self.sess.run(init_op)
+        self.data = VQADataSet()
+        self.data.encode_into_vector()
         
-        # Now both the features from the resnet and lstm are concatenated along the depth axis
-        features = tf.concat([image, text_replicated], axis=3)
-        conv1 = tf.nn.relu(conv2d_layer(features, filters=512, kernel_size=(1,1), name="conv1"))
-        conv2 = conv2d_layer(conv1, filters=2, kernel_size=(1,1), name="conv2")
-        
-        # Flatenning each attention map to perform softmax
-        attention_map = tf.reshape(conv2, (self.batch_size, 14*14, 2))
-        attention_map = tf.nn.softmax(attention_map, axis=1, name = "attention_map")
-        image = tf.reshape(image, (self.batch_size, 192, 2048, 1))
-        attention = tf.tile(tf.expand_dims(attention_map, 2), (1, 1, 2048, 1))
-        image = tf.tile(image,(1,1,1,2))
-        weighted = image * attention
-        weighted_average = tf.reduce_mean(weighted, 1)
-        
-        # Flatten both glimpses into a single vector
-        weighted_average = tf.reshape(weighted_average, (self.batch_size, 2048*2))
-        attention = tf.concat([weighted_average, text], 1)
+        start_time = time.time()
+
+        for epoch in range(epochs):
+            steps = 10#data.number_of_questions // self.batch_size
+            for idx in range(steps):
+                print("\nStarting step {:4d} of epoch {:2d}".format(idx, epoch))
+                print('\nGetting batches')
+                q, a, img = self.data.next_batch(self.batch_size)
+                vqa_dict = {self.questions: q, self.answers: a, self.images: img}
+                _, cost = self.sess.run([train_step, self.loss], feed_dict=vqa_dict)
+                
+                self.global_step += 1
+                print("\nEpoch: [%2d] [%4d/%4d] time: %4.4f, Loss: %.8f"
+                    % (epoch, idx, steps,
+                       time.time() - start_time, cost))
+
+
+    def compute_attention(self, image, text): 
+        with tf.variable_scope("attention") as scope:
+            if self.reuse:
+                scope.reuse_variables()
+            text_replicated = self._replicate_features(text, (1, 14, 14, 1))
+            
+            # Now both the features from the resnet and lstm are concatenated along the depth axis
+            features = tf.nn.dropout(tf.concat([image, text_replicated], axis=3))
+            conv1 = tf.nn.dropout(conv2d_layer(features, filters=512, kernel_size=(1,1), name="attention_conv1"))
+            conv2 = conv2d_layer(conv1, filters=2, kernel_size=(1,1), name="attention_conv2")
+            
+            # Flatenning each attention map to perform softmax
+            attention_map = tf.reshape(conv2, (self.batch_size, 14*14, 2))
+            attention_map = tf.nn.softmax(attention_map, axis=1, name = "attention_map")
+            image = tf.reshape(image, (self.batch_size, 196, 2048, 1))
+            attention = tf.tile(tf.expand_dims(attention_map, 2), (1, 1, 2048, 1))
+            image = tf.tile(image,(1,1,1,2))
+            weighted = image * attention
+            weighted_average = tf.reduce_mean(weighted, 1)
+            
+            # Flatten both glimpses into a single vector
+            weighted_average = tf.reshape(weighted_average, (self.batch_size, 2048*2))
+            attention = tf.nn.dropout(tf.concat([weighted_average, text], 1), self.dropout_prob)
         return attention
 
 
     def _replicate_features(self, input_features, multiples, project=False):
         if not project:
             # Expanding dimensions of LSTM features to 4-D
-            batch, features = input_features.shape
-            x = tf.reshape(input_features, (batch, 1, 1, features))
+            x = tf.reshape(input_features, (self.batch_size, 1, 1, self.state_size))
             replicated = tf.tile(x, multiples)
         else:
             # TODO write deconv network to project LSTM features to resnet output

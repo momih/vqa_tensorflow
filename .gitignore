@@ -2,7 +2,10 @@
 .spyproject/
 logs/
 data/
+resnet_ckpt/
+
 resnet152_weights_tf.h5
 *.pyc
+
 
 
