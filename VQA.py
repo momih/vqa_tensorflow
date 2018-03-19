@@ -12,7 +12,6 @@ import json
 import os
 import re
 
-# TODO add vocab size param
 
 class VQADataSet(object):
     """
@@ -205,7 +204,7 @@ class VQADataSet(object):
         return x
     
 
-def maybe_download_and_extract():
+def maybe_download_and_extract(data_dir):
     """
     Will download and extract the VQA data automatically
     """
